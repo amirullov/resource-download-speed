@@ -41,7 +41,13 @@ def download_once(url):
     request = urllib.request.Request(url, headers={"Accept-Encoding": "identity"}, method="GET")
     size = 0
     start = time.perf_counter()
-    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+    try:
+        response = urllib.request.urlopen(request, timeout=TIMEOUT)
+    except ValueError as exc:
+        # urllib can reject a malformed server-provided redirect URL here.
+        # Keep this boundary narrow: errors in reading or our own code propagate.
+        raise urllib.error.URLError(f"некорректный URL при открытии ответа: {exc}") from exc
+    with response:
         while True:
             block = response.read(BLOCK_SIZE)
             if not block:
@@ -66,33 +72,40 @@ def calculate_metrics(results):
 
 
 def main(argv=None):
-    args = parse_args(argv)
-    results = []
-    number = 1
+    number = None
     try:
-        for number in range(1, DOWNLOAD_COUNT + 1):
-            results.append(download_once(args.url))
+        args = parse_args(argv)
+        results = []
+        try:
+            for number in range(1, DOWNLOAD_COUNT + 1):
+                results.append(download_once(args.url))
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            print(f"Загрузка {number}/10: HTTP {exc.code}. Замер не завершён.", file=sys.stderr)
+            return 1
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else str(exc)
+            print(f"Загрузка {number}/10: {reason}. Замер не завершён.", file=sys.stderr)
+            return 1
+        number = None
+        try:
+            average, size, speed = calculate_metrics(results)
+        except ValueError as exc:
+            print(f"Ошибка измерения: {exc}. Замер не завершён.", file=sys.stderr)
+            return 1
+        # Prepare the whole report before writing; flush inside the interrupt guard.
+        report = (
+            f"Успешных загрузок: {DOWNLOAD_COUNT}\n"
+            f"Среднее время запроса: {average:.3f} с\n"
+            f"Общий объём: {size} байт\n"
+            f"Средняя скорость: {speed:.3f} MiB/s"
+        )
+        print(report, flush=True)
+        return 0
     except KeyboardInterrupt:
-        print(f"Загрузка {number}/10: прервано пользователем. Замер не завершён.", file=sys.stderr)
+        prefix = f"Загрузка {number}/10: " if number is not None else ""
+        print(f"{prefix}прервано пользователем. Замер не завершён.", file=sys.stderr)
         return 130
-    except urllib.error.HTTPError as exc:
-        exc.close()
-        print(f"Загрузка {number}/10: HTTP {exc.code}. Замер не завершён.", file=sys.stderr)
-        return 1
-    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
-        reason = exc.reason if isinstance(exc, urllib.error.URLError) else str(exc)
-        print(f"Загрузка {number}/10: {reason}. Замер не завершён.", file=sys.stderr)
-        return 1
-    try:
-        average, size, speed = calculate_metrics(results)
-    except ValueError as exc:
-        print(f"Ошибка измерения: {exc}. Замер не завершён.", file=sys.stderr)
-        return 1
-    print(f"Успешных загрузок: {DOWNLOAD_COUNT}")
-    print(f"Среднее время запроса: {average:.3f} с")
-    print(f"Общий объём: {size} байт")
-    print(f"Средняя скорость: {speed:.3f} MiB/s")
-    return 0
 
 
 if __name__ == "__main__":

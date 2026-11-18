@@ -1,5 +1,6 @@
 import contextlib
 import io
+import os
 import socket
 import ssl
 import subprocess
@@ -24,6 +25,11 @@ class Handler(BaseHTTPRequestHandler):
         number = len(self.server.requests)
         if self.path == '/fourth' and number == 4:
             self.send_error(404)
+            return
+        if self.path == '/bad-redirect':
+            self.send_response(302)
+            self.send_header('Location', 'http://[broken')
+            self.end_headers()
             return
         if self.path == '/redirect':
             self.send_response(302)
@@ -105,6 +111,42 @@ class Tests(unittest.TestCase):
     def test_redirect(self):
         self.assertEqual(self.run_main('/redirect')[0], 0)
         self.assertEqual(len(self.server.requests), 20)
+
+    def test_malformed_redirect_cli(self):
+        result = subprocess.run(
+            [sys.executable, app.__file__, self.url + '/bad-redirect'],
+            capture_output=True, encoding='utf-8',
+            env={**os.environ, 'PYTHONIOENCODING': 'utf-8', 'NO_PROXY': '127.0.0.1'},
+        )
+        self.assertEqual((result.returncode, result.stdout), (1, ''))
+        self.assertIn('Загрузка 1/10:', result.stderr)
+        self.assertIn('Замер не завершён.', result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_interrupt_outside_download(self):
+        for phase in ('parse_args', 'calculate_metrics'):
+            with self.subTest(phase=phase):
+                with patch.object(app, 'download_once', return_value=(1, 100)), patch.object(app, phase, side_effect=KeyboardInterrupt):
+                    code, out, err = self.run_main('/body')
+                self.assertEqual((code, out), (130, ''))
+                self.assertIn('прервано', err)
+                self.assertNotIn('Загрузка', err)
+
+    def test_interrupt_during_output(self):
+        class InterruptedOutput(io.StringIO):
+            def write(self, text):
+                raise KeyboardInterrupt
+
+        err = io.StringIO()
+        with patch.object(app, 'download_once', return_value=(1, 100)), contextlib.redirect_stdout(InterruptedOutput()), contextlib.redirect_stderr(err):
+            self.assertEqual(app.main([self.url]), 130)
+        self.assertIn('прервано', err.getvalue())
+
+    def test_value_error_in_download_code_is_not_hidden(self):
+        with patch.object(app, 'download_once', side_effect=ValueError('bug')):
+            with self.assertRaises(ValueError):
+                self.run_main('/body')
 
     def test_fourth_error_stops(self):
         code, out, err = self.run_main('/fourth')
