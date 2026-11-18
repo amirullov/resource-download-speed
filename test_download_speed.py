@@ -1,6 +1,7 @@
 import contextlib
 import io
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -157,6 +158,58 @@ class Tests(unittest.TestCase):
         with patch.object(app, 'download_once', side_effect=RuntimeError('bug')):
             with self.assertRaises(RuntimeError):
                 self.run_main('/body')
+
+    def test_streaming_timer_and_close_order(self):
+        events = []
+        chunks = iter([b'a' * app.BLOCK_SIZE, b'b' * 17, b''])
+
+        class Response:
+            headers = {'Content-Length': str(app.BLOCK_SIZE + 17)}
+            chunked = False
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                events.append('close')
+
+            def read(self, size):
+                self_test.assertEqual(size, app.BLOCK_SIZE)
+                events.append('read')
+                return next(chunks)
+
+        self_test = self
+
+        def clock():
+            events.append('clock')
+            return 5.0 if len(events) == 1 else 7.0
+
+        def open_response(request, timeout):
+            events.append('open')
+            self.assertEqual(request.get_method(), 'GET')
+            self.assertEqual(timeout, 30)
+            self.assertEqual(request.get_header('Accept-encoding'), 'identity')
+            return Response()
+
+        with patch.object(app.time, 'perf_counter', side_effect=clock), patch.object(app.urllib.request, 'urlopen', side_effect=open_response):
+            self.assertEqual(app.download_once(self.url), (2.0, app.BLOCK_SIZE + 17))
+        self.assertEqual(events, ['clock', 'open', 'read', 'read', 'read', 'clock', 'close'])
+
+    def test_certificate_error_stops_without_result(self):
+        error = app.urllib.error.URLError(ssl.SSLCertVerificationError('certificate verify failed'))
+        with patch.object(app.urllib.request, 'urlopen', side_effect=error) as opener:
+            code, out, err = self.run_main('/body')
+        self.assertEqual((code, out), (1, ''))
+        self.assertIn('certificate verify failed', err)
+        self.assertIn('1/10', err)
+        self.assertEqual(opener.call_count, 1)
+
+    def test_nonpositive_measurement_fails_without_result(self):
+        with patch.object(app, 'download_once', return_value=(0, 100)):
+            code, out, err = self.run_main('/body')
+        self.assertEqual((code, out), (1, ''))
+        self.assertIn('Ошибка измерения', err)
 
     def test_cli_help_and_missing_url(self):
         for args, expected in ((['--help'], 0), ([], 2)):
